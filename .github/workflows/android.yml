@@ -11,40 +11,63 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+
+      # 1. Checkout repository
       - name: Checkout
         uses: actions/checkout@v4
 
+      # 2. Java 17
       - name: Setup JDK 17
         uses: actions/setup-java@v4
         with:
           distribution: temurin
           java-version: '17'
 
+      # 3. Gradle 8.9
       - name: Setup Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
           gradle-version: '8.9'
 
+      # 4. Check Android SDK
       - name: Check Android SDK
         run: |
           echo "ANDROID_HOME=$ANDROID_HOME"
           echo "ANDROID_SDK_ROOT=$ANDROID_SDK_ROOT"
+
           ls -la "$ANDROID_HOME"
           ls -la "$ANDROID_HOME/cmdline-tools" || true
 
+      # 5. Install Android SDK
       - name: Install Android SDK packages
         run: |
-          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses || true
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
 
-          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+          if [ ! -f "$SDKMANAGER" ]; then
+            echo "latest sdkmanager tidak ditemukan."
+            echo "Mencari sdkmanager..."
+            find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f
+            exit 1
+          fi
+
+          yes | "$SDKMANAGER" --licenses || true
+
+          "$SDKMANAGER" \
             "platform-tools" \
             "platforms;android-35" \
             "build-tools;35.0.0"
 
-      - name: Create Android project
+      # 6. Generate Android project
+      - name: Generate AssetFlux Native project
+        shell: bash
         run: |
+
           mkdir -p app/src/main/java/com/assetflux/nativeviewer
           mkdir -p app/src/main/res/values
+
+          # ----------------------------------------
+          # settings.gradle
+          # ----------------------------------------
 
           cat > settings.gradle <<'EOF'
           pluginManagement {
@@ -57,6 +80,7 @@ jobs:
 
           dependencyResolutionManagement {
               repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+
               repositories {
                   google()
                   mavenCentral()
@@ -64,8 +88,13 @@ jobs:
           }
 
           rootProject.name = "AssetFlux-Native"
+
           include(":app")
           EOF
+
+          # ----------------------------------------
+          # Root build.gradle
+          # ----------------------------------------
 
           cat > build.gradle <<'EOF'
           plugins {
@@ -74,11 +103,21 @@ jobs:
           }
           EOF
 
+          # ----------------------------------------
+          # gradle.properties
+          # ----------------------------------------
+
           cat > gradle.properties <<'EOF'
           org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+
           android.useAndroidX=true
+
           kotlin.code.style=official
           EOF
+
+          # ----------------------------------------
+          # app/build.gradle
+          # ----------------------------------------
 
           cat > app/build.gradle <<'EOF'
           plugins {
@@ -87,41 +126,73 @@ jobs:
           }
 
           android {
+
               namespace 'com.assetflux.nativeviewer'
+
               compileSdk 35
 
               defaultConfig {
+
                   applicationId 'com.assetflux.nativeviewer'
+
                   minSdk 23
+
                   targetSdk 35
+
                   versionCode 1
+
                   versionName "0.1.0"
+              }
+
+              /*
+               * IMPORTANT:
+               *
+               * Java dan Kotlin harus menggunakan
+               * JVM target yang sama.
+               *
+               * Sebelumnya:
+               * Java = 1.8
+               * Kotlin = 17
+               *
+               * Sekarang keduanya = Java 17.
+               */
+
+              compileOptions {
+
+                  sourceCompatibility JavaVersion.VERSION_17
+
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+
+                  jvmTarget = '17'
               }
           }
 
           dependencies {
+
               implementation 'androidx.core:core-ktx:1.15.0'
+
               implementation 'androidx.appcompat:appcompat:1.7.0'
           }
           EOF
 
-          cat > app/src/main/res/values/styles.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="AppTheme"
-                  parent="android:style/Theme.Material.Light.NoActionBar">
-                  <item name="android:windowFullscreen">true</item>
-              </style>
-          </resources>
-          EOF
+          # ----------------------------------------
+          # AndroidManifest.xml
+          # ----------------------------------------
 
           cat > app/src/main/AndroidManifest.xml <<'EOF'
           <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+
+          <manifest
+              xmlns:android="http://schemas.android.com/apk/res/android">
 
               <application
                   android:theme="@style/AppTheme"
-                  android:label="AssetFlux Native">
+                  android:label="AssetFlux Native"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
 
                   <activity
                       android:name=".MainActivity"
@@ -129,8 +200,13 @@ jobs:
                       android:exported="true">
 
                       <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
+
+                          <action
+                              android:name="android.intent.action.MAIN"/>
+
+                          <category
+                              android:name="android.intent.category.LAUNCHER"/>
+
                       </intent-filter>
 
                   </activity>
@@ -139,6 +215,30 @@ jobs:
 
           </manifest>
           EOF
+
+          # ----------------------------------------
+          # styles.xml
+          # ----------------------------------------
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+
+          <resources>
+
+              <style
+                  name="AppTheme"
+                  parent="android:style/Theme.Material.Light.NoActionBar">
+
+                  <item name="android:windowFullscreen">true</item>
+
+              </style>
+
+          </resources>
+          EOF
+
+          # ----------------------------------------
+          # MainActivity.kt
+          # ----------------------------------------
 
           cat > app/src/main/java/com/assetflux/nativeviewer/MainActivity.kt <<'EOF'
           package com.assetflux.nativeviewer
@@ -157,58 +257,97 @@ jobs:
                   super.onCreate(savedInstanceState)
 
                   glView = GLSurfaceView(this)
+
+                  // OpenGL ES 2.0
                   glView.setEGLContextClientVersion(2)
 
-                  glView.setRenderer(object : GLSurfaceView.Renderer {
+                  glView.setRenderer(
+                      object : GLSurfaceView.Renderer {
 
-                      override fun onSurfaceCreated(
-                          gl: GL10?,
-                          config: EGLConfig?
-                      ) {
-                          gl?.glClearColor(
-                              0.05f,
-                              0.05f,
-                              0.05f,
-                              1.0f
-                          )
-                      }
+                          override fun onSurfaceCreated(
+                              gl: GL10?,
+                              config: EGLConfig?
+                          ) {
 
-                      override fun onSurfaceChanged(
-                          gl: GL10?,
-                          width: Int,
-                          height: Int
-                      ) {
-                          gl?.glViewport(0, 0, width, height)
-                      }
+                              gl?.glClearColor(
+                                  0.05f,
+                                  0.05f,
+                                  0.05f,
+                                  1.0f
+                              )
+                          }
 
-                      override fun onDrawFrame(gl: GL10?) {
-                          gl?.glClear(GL10.GL_COLOR_BUFFER_BIT)
+                          override fun onSurfaceChanged(
+                              gl: GL10?,
+                              width: Int,
+                              height: Int
+                          ) {
+
+                              gl?.glViewport(
+                                  0,
+                                  0,
+                                  width,
+                                  height
+                              )
+                          }
+
+                          override fun onDrawFrame(
+                              gl: GL10?
+                          ) {
+
+                              gl?.glClear(
+                                  GL10.GL_COLOR_BUFFER_BIT
+                              )
+                          }
                       }
-                  })
+                  )
 
                   setContentView(glView)
               }
 
               override fun onResume() {
+
                   super.onResume()
+
                   glView.onResume()
               }
 
               override fun onPause() {
+
                   glView.onPause()
+
                   super.onPause()
               }
           }
           EOF
 
+      # 7. Show generated project
+      - name: Show project
+        run: |
+          echo "===== PROJECT ====="
+          find . -maxdepth 6 -type f | sort
+
+      # 8. Generate Gradle Wrapper
       - name: Generate Gradle Wrapper
-        run: gradle wrapper --gradle-version 8.9
+        run: |
+          gradle wrapper --gradle-version 8.9
 
-      - name: Build APK
-        run: ./gradlew assembleDebug
+      # 9. Build APK
+      - name: Build Debug APK
+        run: |
+          chmod +x ./gradlew
+          ./gradlew assembleDebug --stacktrace
 
+      # 10. Check APK
+      - name: Check APK
+        run: |
+          echo "===== APK OUTPUT ====="
+          ls -lh app/build/outputs/apk/debug/
+
+      # 11. Upload APK
       - name: Upload APK
         uses: actions/upload-artifact@v4
         with:
           name: AssetFlux-Native-debug
           path: app/build/outputs/apk/debug/app-debug.apk
+          if-no-files-found: error
