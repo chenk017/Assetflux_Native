@@ -11,36 +11,40 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Ambil file dari repository
+      # 1. Checkout repository
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Siapkan Python
+      # 2. Setup Python
+      # cache pip sengaja tidak digunakan karena
+      # repository belum memiliki requirements.txt.
       - name: Setup Python
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
-          cache: pip
 
-      # 3. Instal UnityPy
+      # 3. Install UnityPy
       - name: Install UnityPy
         run: |
           python -m pip install --upgrade pip
           python -m pip install UnityPy
+          python -c "import UnityPy; print('UnityPy berhasil diinstal')"
 
-      # 4. Periksa file sampel
+      # 4. Validate input
       - name: Check input bundle
         run: |
           FILE="samples/nextkagura_skill03_effect_1.unity3d"
 
           if [ ! -f "$FILE" ]; then
-            echo "ERROR: File bundle tidak ditemukan: $FILE"
+            echo "::error::Bundle tidak ditemukan: $FILE"
+            echo "Pastikan file sudah diunggah ke folder samples."
             exit 1
           fi
 
+          echo "Bundle ditemukan:"
           ls -lh "$FILE"
 
-      # 5. Buat direktori hasil ekstraksi
+      # 5. Create output directories
       - name: Prepare output directories
         run: |
           mkdir -p output/textures
@@ -48,12 +52,11 @@ jobs:
           mkdir -p output/audio
           mkdir -p output/other
 
-      # 6. Buat extractor
+      # 6. Create UnityPy extractor
       - name: Create UnityPy extractor
         shell: bash
         run: |
           cat > extract_unity.py <<'PYTHON'
-          import os
           import json
           import traceback
           from pathlib import Path
@@ -66,15 +69,15 @@ jobs:
 
           OUTPUT = Path("output")
 
-          for folder in [
+          for folder in (
               "textures",
               "textassets",
               "audio",
               "other",
-          ]:
+          ):
               (OUTPUT / folder).mkdir(
                   parents=True,
-                  exist_ok=True
+                  exist_ok=True,
               )
 
           def safe_name(value):
@@ -103,27 +106,20 @@ jobs:
           print("Size:", SOURCE.stat().st_size, "bytes")
 
           try:
-              # Membuka bundle dan serialized assets.
+              # Load bundle with UnityPy.
               env = UnityPy.load(str(SOURCE))
 
               for index, obj in enumerate(env.objects):
+                  record = {
+                      "index": index,
+                      "type": str(obj.type.name),
+                      "path_id": int(obj.path_id),
+                      "name": "",
+                      "export_status": "inventory_only",
+                  }
+
                   try:
                       asset_type = obj.type.name
-                      path_id = int(obj.path_id)
-
-                      record = {
-                          "index": index,
-                          "type": asset_type,
-                          "path_id": path_id,
-                          "name": "",
-                          "export_status": "inventory_only",
-                      }
-
-                      print(
-                          f"[{index}] {asset_type} "
-                          f"path_id={path_id}"
-                      )
-
                       data = obj.read()
 
                       name = getattr(data, "name", "") or ""
@@ -132,7 +128,13 @@ jobs:
                       filename = (
                           f"{index:04d}_"
                           f"{safe_name(name or asset_type)}_"
-                          f"{path_id}"
+                          f"{obj.path_id}"
+                      )
+
+                      print(
+                          f"[{index}] {asset_type}: "
+                          f"{name or '(unnamed)'} "
+                          f"path_id={obj.path_id}"
                       )
 
                       # Texture2D -> PNG
@@ -150,68 +152,65 @@ jobs:
                               record["export_status"] = "exported"
                               record["output"] = str(destination)
 
-                              print("  Texture:", destination)
+                              print("  Exported:", destination)
+
                           else:
                               record["export_status"] = (
                                   "image_unavailable"
                               )
 
-                      # TextAsset -> TXT atau BIN
+                      # TextAsset -> raw binary
                       elif asset_type == "TextAsset":
-                          script_data = getattr(
+                          content = getattr(
                               data, "m_Script", None
                           )
 
-                          if script_data is not None:
+                          if content is not None:
                               destination = (
                                   OUTPUT / "textassets" /
                                   f"{filename}.bin"
                               )
 
-                              destination.write_bytes(
-                                  bytes(script_data)
-                              )
+                              destination.write_bytes(bytes(content))
 
                               record["export_status"] = "exported"
                               record["output"] = str(destination)
 
-                      # AudioClip -> BIN
+                      # AudioClip -> raw audio data, if available
                       elif asset_type == "AudioClip":
-                          audio_data = getattr(
+                          content = getattr(
                               data, "m_AudioData", None
                           )
 
-                          if audio_data:
+                          if content:
                               destination = (
                                   OUTPUT / "audio" /
                                   f"{filename}.bin"
                               )
 
-                              destination.write_bytes(
-                                  bytes(audio_data)
-                              )
+                              destination.write_bytes(bytes(content))
 
                               record["export_status"] = (
                                   "raw_audio_exported"
                               )
                               record["output"] = str(destination)
 
-                      # Catat jenis asset lain tanpa menganggap
-                      # semuanya sudah berhasil diekstrak.
                       report["assets"].append(record)
 
                   except Exception as exc:
-                      error = {
+                      report["export_errors"].append({
                           "index": index,
-                          "path_id": str(
-                              getattr(obj, "path_id", "")
-                          ),
+                          "type": record["type"],
+                          "path_id": record["path_id"],
                           "error": str(exc),
-                      }
+                      })
 
-                      report["export_errors"].append(error)
+                      record["export_status"] = "error"
+                      record["error"] = str(exc)
 
-                      print("  ERROR:", exc)
+                      report["assets"].append(record)
+
+                      print("  Asset error:", exc)
 
               report["asset_count"] = len(report["assets"])
               report["status"] = "completed"
@@ -230,15 +229,18 @@ jobs:
                   json.dumps(
                       report,
                       indent=2,
-                      ensure_ascii=False
+                      ensure_ascii=False,
                   ),
-                  encoding="utf-8"
+                  encoding="utf-8",
               )
 
               print("=" * 60)
               print("Status:", report["status"])
               print("Asset records:", report["asset_count"])
-              print("Export errors:", len(report["export_errors"]))
+              print(
+                  "Export errors:",
+                  len(report["export_errors"]),
+              )
               print("Report:", report_path)
               print("=" * 60)
 
@@ -246,12 +248,12 @@ jobs:
               raise SystemExit(1)
           PYTHON
 
-      # 7. Jalankan ekstraksi
+      # 7. Run extractor
       - name: Extract Unity bundle
         run: |
           python extract_unity.py
 
-      # 8. Tampilkan hasil
+      # 8. Show extraction results
       - name: Show extracted files
         if: always()
         run: |
@@ -259,7 +261,7 @@ jobs:
           find output -type f -printf '%p (%s bytes)\n' \
             2>/dev/null || true
 
-      # 9. Simpan hasil sebagai artifact
+      # 9. Upload report and extracted assets
       - name: Upload extraction results
         if: always()
         uses: actions/upload-artifact@v4
