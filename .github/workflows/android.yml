@@ -1,445 +1,269 @@
-name: Build AssetFlux Native
+name: AssetFlux - UnityPy Extractor
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  extract:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repository
-      - name: Checkout
+      # 1. Ambil file dari repository
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Java 17
-      - name: Setup JDK 17
-        uses: actions/setup-java@v4
+      # 2. Siapkan Python
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
-          distribution: temurin
-          java-version: '17'
+          python-version: '3.11'
+          cache: pip
 
-      # 3. Gradle
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      # 4. Install Android SDK
-      - name: Install Android SDK
+      # 3. Instal UnityPy
+      - name: Install UnityPy
         run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          python -m pip install --upgrade pip
+          python -m pip install UnityPy
 
-          if [ ! -f "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-              -name sdkmanager -type f | head -n 1)"
-          fi
+      # 4. Periksa file sampel
+      - name: Check input bundle
+        run: |
+          FILE="samples/nextkagura_skill03_effect_1.unity3d"
 
-          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager tidak ditemukan."
+          if [ ! -f "$FILE" ]; then
+            echo "ERROR: File bundle tidak ditemukan: $FILE"
             exit 1
           fi
 
-          yes | "$SDKMANAGER" --licenses || true
+          ls -lh "$FILE"
 
-          "$SDKMANAGER" \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
+      # 5. Buat direktori hasil ekstraksi
+      - name: Prepare output directories
+        run: |
+          mkdir -p output/textures
+          mkdir -p output/textassets
+          mkdir -p output/audio
+          mkdir -p output/other
 
-      # 5. Generate project
-      - name: Generate AssetFlux project
+      # 6. Buat extractor
+      - name: Create UnityPy extractor
         shell: bash
         run: |
-          mkdir -p app/src/main/java/com/assetflux/nativeviewer
-          mkdir -p app/src/main/res/values
+          cat > extract_unity.py <<'PYTHON'
+          import os
+          import json
+          import traceback
+          from pathlib import Path
 
-          cat > settings.gradle <<'EOF'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+          import UnityPy
+
+          SOURCE = Path(
+              "samples/nextkagura_skill03_effect_1.unity3d"
+          )
+
+          OUTPUT = Path("output")
+
+          for folder in [
+              "textures",
+              "textassets",
+              "audio",
+              "other",
+          ]:
+              (OUTPUT / folder).mkdir(
+                  parents=True,
+                  exist_ok=True
+              )
+
+          def safe_name(value):
+              value = str(value or "unnamed")
+              return "".join(
+                  c if c.isalnum() or c in "-_." else "_"
+                  for c in value
+              )[:100]
+
+          report = {
+              "input": str(SOURCE),
+              "file_size": SOURCE.stat().st_size,
+              "unitypy_version": getattr(
+                  UnityPy, "__version__", "unknown"
+              ),
+              "status": "starting",
+              "asset_count": 0,
+              "assets": [],
+              "export_errors": [],
           }
 
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
+          print("=" * 60)
+          print("ASSETFLUX UNITYPY EXTRACTOR")
+          print("=" * 60)
+          print("Input:", SOURCE)
+          print("Size:", SOURCE.stat().st_size, "bytes")
 
-          rootProject.name = "AssetFlux-Native"
-          include(":app")
-          EOF
+          try:
+              # Membuka bundle dan serialized assets.
+              env = UnityPy.load(str(SOURCE))
 
-          cat > build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application' version '8.7.3' apply false
-              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
-          }
-          EOF
+              for index, obj in enumerate(env.objects):
+                  try:
+                      asset_type = obj.type.name
+                      path_id = int(obj.path_id)
 
-          cat > gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          kotlin.code.style=official
-          EOF
+                      record = {
+                          "index": index,
+                          "type": asset_type,
+                          "path_id": path_id,
+                          "name": "",
+                          "export_status": "inventory_only",
+                      }
 
-          cat > app/build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
-          }
-
-          android {
-              namespace 'com.assetflux.nativeviewer'
-              compileSdk 35
-
-              defaultConfig {
-                  applicationId 'com.assetflux.nativeviewer'
-                  minSdk 23
-                  targetSdk 35
-                  versionCode 2
-                  versionName "0.2.0"
-              }
-
-              compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_17
-                  targetCompatibility JavaVersion.VERSION_17
-              }
-
-              kotlinOptions {
-                  jvmTarget = '17'
-              }
-          }
-          EOF
-
-          cat > app/src/main/res/values/styles.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="AppTheme"
-                  parent="android:style/Theme.Material.Light.NoActionBar">
-                  <item name="android:windowLightStatusBar">true</item>
-                  <item name="android:colorAccent">#6750A4</item>
-              </style>
-          </resources>
-          EOF
-
-          cat > app/src/main/AndroidManifest.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
-
-              <application
-                  android:theme="@style/AppTheme"
-                  android:label="AssetFlux Native"
-                  android:allowBackup="false"
-                  android:supportsRtl="true">
-
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true">
-
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
-                      </intent-filter>
-
-                  </activity>
-              </application>
-          </manifest>
-          EOF
-
-          cat > app/src/main/java/com/assetflux/nativeviewer/MainActivity.kt <<'EOF'
-          package com.assetflux.nativeviewer
-
-          import android.app.Activity
-          import android.os.Bundle
-          import android.content.Intent
-          import android.net.Uri
-          import android.view.Gravity
-          import android.view.ViewGroup
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.ScrollView
-          import android.widget.TextView
-          import java.io.DataInputStream
-          import java.io.BufferedInputStream
-          import java.io.ByteArrayInputStream
-          import java.nio.ByteBuffer
-          import java.nio.ByteOrder
-
-          class MainActivity : Activity() {
-
-              private lateinit var resultText: TextView
-
-              companion object {
-                  private const val PICK_BUNDLE = 1001
-              }
-
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-
-                  val root = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      setPadding(24, 32, 24, 24)
-                      setBackgroundColor(0xFFF5F5F5.toInt())
-                  }
-
-                  val title = TextView(this).apply {
-                      text = "AssetFlux Native"
-                      textSize = 26f
-                      setTextColor(0xFF292929.toInt())
-                  }
-
-                  val subtitle = TextView(this).apply {
-                      text = "Unity AssetBundle Inspector"
-                      textSize = 15f
-                      setPadding(0, 4, 0, 20)
-                  }
-
-                  val selectButton = Button(this).apply {
-                      text = "Pilih file .unity3d"
-                      setOnClickListener { selectBundle() }
-                  }
-
-                  resultText = TextView(this).apply {
-                      textSize = 14f
-                      setTextColor(0xFF202020.toInt())
-                      setPadding(0, 20, 0, 20)
-                      text = """
-                          AssetFlux Native v0.2
-
-                          Tahap 1: UnityFS Header Inspector
-
-                          Pilih file Unity AssetBundle
-                          untuk memeriksa header dan
-                          versi Unity yang tercatat.
-
-                          Catatan:
-                          Pemeriksaan header belum berarti
-                          seluruh asset berhasil diekstrak.
-                      """.trimIndent()
-                  }
-
-                  val scroll = ScrollView(this).apply {
-                      addView(resultText)
-                  }
-
-                  root.addView(title)
-                  root.addView(subtitle)
-                  root.addView(selectButton)
-
-                  root.addView(
-                      scroll,
-                      LinearLayout.LayoutParams(
-                          ViewGroup.LayoutParams.MATCH_PARENT,
-                          0,
-                          1f
+                      print(
+                          f"[{index}] {asset_type} "
+                          f"path_id={path_id}"
                       )
-                  )
 
-                  setContentView(root)
-              }
+                      data = obj.read()
 
-              private fun selectBundle() {
-                  val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                      addCategory(Intent.CATEGORY_OPENABLE)
-                      type = "*/*"
-                  }
+                      name = getattr(data, "name", "") or ""
+                      record["name"] = name
 
-                  startActivityForResult(intent, PICK_BUNDLE)
-              }
+                      filename = (
+                          f"{index:04d}_"
+                          f"{safe_name(name or asset_type)}_"
+                          f"{path_id}"
+                      )
 
-              @Deprecated("Uses the Android document picker callback")
-              override fun onActivityResult(
-                  requestCode: Int,
-                  resultCode: Int,
-                  data: Intent?
-              ) {
-                  super.onActivityResult(requestCode, resultCode, data)
+                      # Texture2D -> PNG
+                      if asset_type == "Texture2D":
+                          image = getattr(data, "image", None)
 
-                  if (requestCode != PICK_BUNDLE ||
-                      resultCode != RESULT_OK) {
-                      return
-                  }
+                          if image is not None:
+                              destination = (
+                                  OUTPUT / "textures" /
+                                  f"{filename}.png"
+                              )
 
-                  val uri = data?.data ?: return
+                              image.save(destination)
 
-                  resultText.text = "Membaca file...\n"
+                              record["export_status"] = "exported"
+                              record["output"] = str(destination)
 
-                  Thread {
-                      val report = try {
-                          contentResolver.openInputStream(uri).use { input ->
-                              requireNotNull(input) {
-                                  "File tidak dapat dibuka."
-                              }
+                              print("  Texture:", destination)
+                          else:
+                              record["export_status"] = (
+                                  "image_unavailable"
+                              )
 
-                              inspectBundle(input.readBytes())
-                          }
-                      } catch (e: Exception) {
-                          "Gagal membaca file:\n${e.message}"
+                      # TextAsset -> TXT atau BIN
+                      elif asset_type == "TextAsset":
+                          script_data = getattr(
+                              data, "m_Script", None
+                          )
+
+                          if script_data is not None:
+                              destination = (
+                                  OUTPUT / "textassets" /
+                                  f"{filename}.bin"
+                              )
+
+                              destination.write_bytes(
+                                  bytes(script_data)
+                              )
+
+                              record["export_status"] = "exported"
+                              record["output"] = str(destination)
+
+                      # AudioClip -> BIN
+                      elif asset_type == "AudioClip":
+                          audio_data = getattr(
+                              data, "m_AudioData", None
+                          )
+
+                          if audio_data:
+                              destination = (
+                                  OUTPUT / "audio" /
+                                  f"{filename}.bin"
+                              )
+
+                              destination.write_bytes(
+                                  bytes(audio_data)
+                              )
+
+                              record["export_status"] = (
+                                  "raw_audio_exported"
+                              )
+                              record["output"] = str(destination)
+
+                      # Catat jenis asset lain tanpa menganggap
+                      # semuanya sudah berhasil diekstrak.
+                      report["assets"].append(record)
+
+                  except Exception as exc:
+                      error = {
+                          "index": index,
+                          "path_id": str(
+                              getattr(obj, "path_id", "")
+                          ),
+                          "error": str(exc),
                       }
 
-                      runOnUiThread {
-                          resultText.text = report
-                      }
-                  }.start()
-              }
+                      report["export_errors"].append(error)
 
-              private fun inspectBundle(bytes: ByteArray): String {
-                  if (bytes.size < 16) {
-                      return "File terlalu kecil untuk menjadi bundle UnityFS."
-                  }
+                      print("  ERROR:", exc)
 
-                  val input = DataInputStream(
-                      BufferedInputStream(ByteArrayInputStream(bytes))
-                  )
+              report["asset_count"] = len(report["assets"])
+              report["status"] = "completed"
 
-                  fun readCString(): String {
-                      val output = StringBuilder()
+          except Exception as exc:
+              report["status"] = "failed"
+              report["fatal_error"] = str(exc)
+              report["traceback"] = traceback.format_exc()
 
-                      while (true) {
-                          val value = input.read()
-                          if (value < 0) {
-                              error("String header tidak lengkap.")
-                          }
-                          if (value == 0) break
+              print(traceback.format_exc())
 
-                          output.append(value.toChar())
+          finally:
+              report_path = OUTPUT / "asset_report.json"
 
-                          if (output.length > 4096) {
-                              error("String header terlalu panjang.")
-                          }
-                      }
+              report_path.write_text(
+                  json.dumps(
+                      report,
+                      indent=2,
+                      ensure_ascii=False
+                  ),
+                  encoding="utf-8"
+              )
 
-                      return output.toString()
-                  }
+              print("=" * 60)
+              print("Status:", report["status"])
+              print("Asset records:", report["asset_count"])
+              print("Export errors:", len(report["export_errors"]))
+              print("Report:", report_path)
+              print("=" * 60)
 
-                  val signature = readCString()
+          if report["status"] == "failed":
+              raise SystemExit(1)
+          PYTHON
 
-                  if (signature != "UnityFS") {
-                      return """
-                          Format bukan UnityFS.
-
-                          Signature: $signature
-                          Ukuran file: ${bytes.size} byte
-
-                          Bundle ini mungkin menggunakan format lain.
-                      """.trimIndent()
-                  }
-
-                  val formatVersion = input.readInt()
-                  val playerVersion = readCString()
-                  val engineVersion = readCString()
-
-                  val bundleSize = input.readLong()
-                  val compressedInfoSize = input.readInt()
-                  val uncompressedInfoSize = input.readInt()
-                  val flags = input.readInt()
-
-                  val compressionType = flags and 0x3F
-
-                  val compressionName = when (compressionType) {
-                      0 -> "None"
-                      1 -> "LZMA"
-                      2 -> "LZ4"
-                      3 -> "LZ4HC"
-                      else -> "Unknown ($compressionType)"
-                  }
-
-                  val headerEnd = bytes.size -
-                      input.available()
-
-                  val sizeStatus = if (bundleSize == bytes.size.toLong()) {
-                      "Cocok"
-                  } else {
-                      "Berbeda dari ukuran aktual"
-                  }
-
-                  return """
-                      ASSETFLUX NATIVE
-                      ==============================
-
-                      HASIL PEMERIKSAAN HEADER
-
-                      Signature:
-                      $signature
-
-                      Format version:
-                      $formatVersion
-
-                      Unity player version:
-                      $playerVersion
-
-                      Unity engine version:
-                      $engineVersion
-
-                      Ukuran bundle di header:
-                      $bundleSize byte
-
-                      Ukuran file aktual:
-                      ${bytes.size} byte
-
-                      Pemeriksaan ukuran:
-                      $sizeStatus
-
-                      Compressed block-info size:
-                      $compressedInfoSize byte
-
-                      Uncompressed block-info size:
-                      $uncompressedInfoSize byte
-
-                      Flags:
-                      0x${flags.toUInt().toString(16).uppercase()}
-
-                      Compression block-info:
-                      $compressionName
-
-                      Posisi akhir header:
-                      $headerEnd byte
-
-                      ==============================
-
-                      STATUS:
-                      Header berhasil dibaca.
-
-                      LANGKAH BERIKUTNYA:
-                      Membaca metadata UnityFS,
-                      mendekompresi blok data,
-                      lalu memeriksa serialized assets.
-
-                      Belum ada klaim bahwa Mesh,
-                      Material, Texture, atau animasi
-                      berhasil diekstrak.
-                  """.trimIndent()
-              }
-          }
-          EOF
-
-      # 6. Generate Gradle Wrapper
-      - name: Generate Gradle Wrapper
-        run: gradle wrapper --gradle-version 8.9
-
-      # 7. Build APK
-      - name: Build APK
-        run: ./gradlew assembleDebug --stacktrace
-
-      # 8. Verify APK
-      - name: Verify APK
+      # 7. Jalankan ekstraksi
+      - name: Extract Unity bundle
         run: |
-          test -f app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+          python extract_unity.py
 
-      # 9. Upload APK
-      - name: Upload APK
+      # 8. Tampilkan hasil
+      - name: Show extracted files
+        if: always()
+        run: |
+          echo "===== OUTPUT FILES ====="
+          find output -type f -printf '%p (%s bytes)\n' \
+            2>/dev/null || true
+
+      # 9. Simpan hasil sebagai artifact
+      - name: Upload extraction results
+        if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: AssetFlux-Native-v0.2
-          path: app/build/outputs/apk/debug/app-debug.apk
-          if-no-files-found: error
+          name: AssetFlux-UnityPy-Extraction
+          path: output/
+          if-no-files-found: warn
