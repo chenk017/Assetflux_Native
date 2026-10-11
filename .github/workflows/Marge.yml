@@ -1,441 +1,655 @@
-name: Build AssetFlux Native
+name: AssetFlux UnityBundle Extraction
 
 on:
   workflow_dispatch:
-  push:
-    branches:
-      - main
+
+permissions:
+  contents: read
 
 jobs:
-  build:
+  extract:
     runs-on: ubuntu-latest
 
     steps:
-      # 1. Checkout repository
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
-      # 2. Java 17
-      - name: Setup JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up Python
+        uses: actions/setup-python@v5
         with:
-          distribution: temurin
-          java-version: '17'
+          python-version: "3.11"
 
-      # 3. Gradle
-      - name: Setup Gradle
-        uses: gradle/actions/setup-gradle@v4
-        with:
-          gradle-version: '8.9'
-
-      # 4. Install Android SDK
-      - name: Install Android SDK
+      - name: Install UnityPy
         run: |
-          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          python -m pip install --upgrade pip
+          python -m pip install UnityPy
 
-          if [ ! -f "$SDKMANAGER" ]; then
-            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" \
-              -name sdkmanager -type f | head -n 1)"
-          fi
+      - name: Validate source bundle
+        shell: bash
+        run: |
+          set -euo pipefail
 
-          if [ -z "$SDKMANAGER" ] || [ ! -f "$SDKMANAGER" ]; then
-            echo "ERROR: sdkmanager tidak ditemukan."
+          SOURCE="samples/nextkagura_skill03_effect_1.unity3d"
+
+          if [ ! -f "$SOURCE" ]; then
+            echo "::error::Bundle tidak ditemukan: $SOURCE"
             exit 1
           fi
 
-          yes | "$SDKMANAGER" --licenses || true
+          echo "Bundle ditemukan."
+          ls -lh "$SOURCE"
 
-          "$SDKMANAGER" \
-            "platform-tools" \
-            "platforms;android-35" \
-            "build-tools;35.0.0"
-
-      # 5. Generate project
-      - name: Generate AssetFlux project
+      - name: Extract assets and relationships
         shell: bash
         run: |
-          mkdir -p app/src/main/java/com/assetflux/nativeviewer
-          mkdir -p app/src/main/res/values
+          set -euo pipefail
 
-          cat > settings.gradle <<'EOF'
-          pluginManagement {
-              repositories {
-                  google()
-                  mavenCentral()
-                  gradlePluginPortal()
-              }
+          mkdir -p output/textures
+          mkdir -p output/meshes
+          mkdir -p output/audio
+          mkdir -p output/textassets
+          mkdir -p output/diagnostics
+
+          cat > extract_unity.py <<'PYTHON'
+          import json
+          import traceback
+          from pathlib import Path
+
+          import UnityPy
+
+          SOURCE = Path(
+              "samples/nextkagura_skill03_effect_1.unity3d"
+          )
+
+          OUT = Path("output")
+          TEXTURES = OUT / "textures"
+          MESHES = OUT / "meshes"
+          AUDIO = OUT / "audio"
+          TEXTASSETS = OUT / "textassets"
+          DIAGNOSTICS = OUT / "diagnostics"
+
+          for directory in (
+              TEXTURES,
+              MESHES,
+              AUDIO,
+              TEXTASSETS,
+              DIAGNOSTICS,
+          ):
+              directory.mkdir(parents=True, exist_ok=True)
+
+          def safe_name(value):
+              value = str(value or "unnamed")
+              return "".join(
+                  c if c.isalnum() or c in "-_." else "_"
+                  for c in value
+              )[:100] or "unnamed"
+
+          def get_name(data):
+              try:
+                  return str(getattr(data, "m_Name", "") or "")
+              except Exception:
+                  return ""
+
+          def pointer_info(value):
+              """Return a pointer description without dereferencing it."""
+              if value is None:
+                  return None
+
+              result = {}
+
+              for attr in ("file_id", "path_id"):
+                  try:
+                      v = getattr(value, attr, None)
+                      if v is not None:
+                          result[attr] = int(v)
+                  except Exception:
+                      pass
+
+              if result:
+                  result["python_type"] = type(value).__name__
+                  return result
+
+              return None
+
+          def walk(value, path="$", depth=0, seen=None):
+              """
+              Find serialized pointer references while avoiding cycles.
+              The output is diagnostic metadata, not a full Unity serializer.
+              """
+              if seen is None:
+                  seen = set()
+
+              if depth > 12:
+                  return []
+
+              ptr = pointer_info(value)
+              if ptr is not None:
+                  return [{
+                      "field": path,
+                      "reference": ptr,
+                  }]
+
+              if value is None or isinstance(
+                  value, (str, bytes, int, float, bool)
+              ):
+                  return []
+
+              ident = id(value)
+              if ident in seen:
+                  return []
+              seen.add(ident)
+
+              found = []
+
+              if isinstance(value, dict):
+                  items = value.items()
+              elif isinstance(value, (list, tuple, set)):
+                  items = enumerate(value)
+              else:
+                  # Avoid traversing arbitrary Python internals.
+                  try:
+                      attrs = vars(value)
+                  except Exception:
+                      attrs = None
+
+                  if attrs is None:
+                      return found
+
+                  items = attrs.items()
+
+              try:
+                  for key, child in items:
+                      child_path = f"{path}.{key}"
+
+                      found.extend(
+                          walk(
+                              child,
+                              child_path,
+                              depth + 1,
+                              seen,
+                          )
+                      )
+              except Exception:
+                  pass
+
+              return found
+
+          def json_safe(value, depth=0):
+              """Convert common UnityPy values to JSON-safe diagnostics."""
+              if depth > 6:
+                  return "<max-depth>"
+
+              if value is None or isinstance(
+                  value, (str, int, float, bool)
+              ):
+                  return value
+
+              ptr = pointer_info(value)
+              if ptr is not None:
+                  return {"pointer": ptr}
+
+              if isinstance(value, bytes):
+                  return {
+                      "type": "bytes",
+                      "length": len(value),
+                  }
+
+              if isinstance(value, dict):
+                  result = {}
+                  for k, v in list(value.items())[:300]:
+                      result[str(k)] = json_safe(v, depth + 1)
+                  return result
+
+              if isinstance(value, (list, tuple)):
+                  return [
+                      json_safe(v, depth + 1)
+                      for v in value[:300]
+                  ]
+
+              try:
+                  attrs = vars(value)
+              except Exception:
+                  return {
+                      "type": type(value).__name__,
+                      "repr": str(value)[:300],
+                  }
+
+              result = {"type": type(value).__name__}
+
+              for key, child in list(attrs.items())[:100]:
+                  if key.startswith("_"):
+                      continue
+                  try:
+                      result[key] = json_safe(child, depth + 1)
+                  except Exception:
+                      result[key] = "<unavailable>"
+
+              return result
+
+          report = {
+              "source": str(SOURCE),
+              "unitypy_version": getattr(
+                  UnityPy, "__version__", "unknown"
+              ),
+              "asset_count": 0,
+              "assets": [],
+              "exports": {
+                  "textures": [],
+                  "meshes": [],
+                  "audio": [],
+                  "textassets": [],
+              },
+              "errors": [],
           }
 
-          dependencyResolutionManagement {
-              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
-              repositories {
-                  google()
-                  mavenCentral()
-              }
-          }
+          print(f"Loading bundle: {SOURCE}")
+          env = UnityPy.load(str(SOURCE))
 
-          rootProject.name = "AssetFlux-Native"
-          include(":app")
-          EOF
+          objects = list(env.objects)
+          report["asset_count"] = len(objects)
 
-          cat > build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application' version '8.7.3' apply false
-              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
-          }
-          EOF
+          print(f"Objects found: {len(objects)}")
 
-          cat > gradle.properties <<'EOF'
-          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
-          android.useAndroidX=true
-          kotlin.code.style=official
-          EOF
+          for index, obj in enumerate(objects):
+              try:
+                  type_name = str(obj.type.name)
+              except Exception:
+                  type_name = "Unknown"
 
-          cat > app/build.gradle <<'EOF'
-          plugins {
-              id 'com.android.application'
-              id 'org.jetbrains.kotlin.android'
-          }
+              try:
+                  path_id = int(obj.path_id)
+              except Exception:
+                  path_id = index
 
-          android {
-              namespace 'com.assetflux.nativeviewer'
-              compileSdk 35
-
-              defaultConfig {
-                  applicationId 'com.assetflux.nativeviewer'
-                  minSdk 23
-                  targetSdk 35
-                  versionCode 2
-                  versionName "0.2.0"
+              record = {
+                  "type": type_name,
+                  "path_id": path_id,
+                  "name": "",
+                  "export_status": "inventory_only",
+                  "references": [],
+                  "data": {},
               }
 
-              compileOptions {
-                  sourceCompatibility JavaVersion.VERSION_17
-                  targetCompatibility JavaVersion.VERSION_17
-              }
+              try:
+                  data = obj.read()
+                  record["name"] = get_name(data)
 
-              kotlinOptions {
-                  jvmTarget = '17'
-              }
-          }
-          EOF
+                  # Record references found in serialized fields.
+                  try:
+                      record["references"] = walk(data)
+                  except Exception as exc:
+                      record["reference_scan_error"] = str(exc)
 
-          cat > app/src/main/res/values/styles.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <resources>
-              <style name="AppTheme"
-                  parent="android:style/Theme.Material.Light.NoActionBar">
-                  <item name="android:windowLightStatusBar">true</item>
-                  <item name="android:colorAccent">#6750A4</item>
-              </style>
-          </resources>
-          EOF
+                  # Keep selected metadata for analysis.
+                  if type_name in (
+                      "GameObject",
+                      "Transform",
+                      "MeshFilter",
+                      "MeshRenderer",
+                      "SkinnedMeshRenderer",
+                      "Material",
+                      "Mesh",
+                      "AnimationClip",
+                      "Animation",
+                      "ParticleSystem",
+                      "ParticleSystemRenderer",
+                      "Shader",
+                      "Texture2D",
+                  ):
+                      try:
+                          record["data"] = json_safe(data)
+                      except Exception as exc:
+                          record["data_error"] = str(exc)
 
-          cat > app/src/main/AndroidManifest.xml <<'EOF'
-          <?xml version="1.0" encoding="utf-8"?>
-          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+                  stem = (
+                      f"{path_id}_"
+                      f"{safe_name(record['name'] or type_name)}"
+                  )
 
-              <application
-                  android:theme="@style/AppTheme"
-                  android:label="AssetFlux Native"
-                  android:allowBackup="false"
-                  android:supportsRtl="true">
+                  # Texture2D -> PNG
+                  if type_name == "Texture2D":
+                      try:
+                          image = data.image
+                          if image is None:
+                              raise RuntimeError(
+                                  "UnityPy returned no image"
+                              )
 
-                  <activity
-                      android:name=".MainActivity"
-                      android:exported="true">
+                          destination = TEXTURES / f"{stem}.png"
+                          image.save(destination)
 
-                      <intent-filter>
-                          <action android:name="android.intent.action.MAIN"/>
-                          <category android:name="android.intent.category.LAUNCHER"/>
-                      </intent-filter>
+                          record["export_status"] = "exported"
+                          record["export_path"] = str(destination)
 
-                  </activity>
-              </application>
-          </manifest>
-          EOF
+                          report["exports"]["textures"].append(
+                              str(destination)
+                          )
 
-          cat > app/src/main/java/com/assetflux/nativeviewer/MainActivity.kt <<'EOF'
-          package com.assetflux.nativeviewer
+                      except Exception as exc:
+                          record["export_status"] = "failed"
+                          record["export_error"] = str(exc)
 
-          import android.app.Activity
-          import android.content.Intent
-          import android.graphics.BitmapFactory
-          import android.net.Uri
-          import android.opengl.GLES20
-          import android.opengl.GLSurfaceView
-          import android.opengl.Matrix
-          import android.os.Bundle
-          import android.view.MotionEvent
-          import android.view.View
-          import android.widget.Button
-          import android.widget.LinearLayout
-          import android.widget.TextView
-          import java.nio.ByteBuffer
-          import java.nio.ByteOrder
-          import java.nio.FloatBuffer
-          import javax.microedition.khronos.egl.EGLConfig
-          import javax.microedition.khronos.opengles.GL10
-          import kotlin.math.max
-          import kotlin.math.min
+                  # Mesh -> attempt supported UnityPy exporter.
+                  elif type_name == "Mesh":
+                      try:
+                          exporter = getattr(data, "export", None)
 
-          class MainActivity : Activity() {
-              private lateinit var status: TextView
-              private lateinit var renderer: ObjRenderer
-              private lateinit var glView: GLSurfaceView
-              private val PICK_OBJ = 101
-              private val PICK_PNG = 102
-              private var dragX = 0f
-              private var dragY = 0f
+                          if not callable(exporter):
+                              raise RuntimeError(
+                                  "Mesh.export() is unavailable "
+                                  "in this UnityPy version"
+                              )
 
-              override fun onCreate(savedInstanceState: Bundle?) {
-                  super.onCreate(savedInstanceState)
-                  renderer = ObjRenderer()
-                  glView = GLSurfaceView(this).apply {
-                      setEGLContextClientVersion(2)
-                      setRenderer(renderer)
-                      renderMode = GLSurfaceView.RENDERMODE_CONTINUOUSLY
-                      setOnTouchListener { _, event ->
-                          when (event.action) {
-                              MotionEvent.ACTION_DOWN -> { dragX = event.x; dragY = event.y; true }
-                              MotionEvent.ACTION_MOVE -> {
-                                  val dx = event.x - dragX
-                                  val dy = event.y - dragY
-                                  renderer.rotateBy(dx * 0.6f, dy * 0.6f)
-                                  dragX = event.x; dragY = event.y
-                                  true
-                              }
-                              else -> true
-                          }
-                      }
-                  }
-                  status = TextView(this).apply {
-                      text = "Pilih file OBJ, lalu pilih PNG teksturnya.\nSeret layar untuk memutar model."
-                      textSize = 14f
-                      setPadding(12, 8, 12, 8)
-                  }
-                  val chooseObj = Button(this).apply {
-                      text = "Pilih Mesh .obj"
-                      setOnClickListener { pickFile(PICK_OBJ, "*/*") }
-                  }
-                  val choosePng = Button(this).apply {
-                      text = "Pilih tekstur .png"
-                      setOnClickListener { pickFile(PICK_PNG, "image/png") }
-                  }
-                  val reset = Button(this).apply {
-                      text = "Reset rotasi"
-                      setOnClickListener { renderer.resetRotation() }
-                  }
-                  val buttons = LinearLayout(this).apply {
-                      orientation = LinearLayout.HORIZONTAL
-                      addView(chooseObj, LinearLayout.LayoutParams(0, -2, 1f))
-                      addView(choosePng, LinearLayout.LayoutParams(0, -2, 1f))
-                      addView(reset, LinearLayout.LayoutParams(0, -2, 1f))
-                  }
-                  val root = LinearLayout(this).apply {
-                      orientation = LinearLayout.VERTICAL
-                      addView(buttons)
-                      addView(status)
-                      addView(glView, LinearLayout.LayoutParams(-1, 0, 1f))
-                  }
-                  setContentView(root)
-              }
+                          exported = exporter()
 
-              private fun pickFile(request: Int, mime: String) {
-                  val intent = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
-                      addCategory(Intent.CATEGORY_OPENABLE)
-                      type = mime
-                  }
-                  startActivityForResult(intent, request)
-              }
+                          if isinstance(exported, bytes):
+                              destination = MESHES / f"{stem}.bin"
+                              destination.write_bytes(exported)
 
-              @Deprecated("Document picker callback")
-              override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
-                  super.onActivityResult(requestCode, resultCode, data)
-                  if (resultCode != RESULT_OK) return
-                  val uri = data?.data ?: return
-                  try {
-                      when (requestCode) {
-                          PICK_OBJ -> {
-                              val text = contentResolver.openInputStream(uri)!!.bufferedReader().use { it.readText() }
-                              val mesh = ObjParser.parse(text)
-                              renderer.setMesh(mesh.positions, mesh.uvs)
-                              status.text = "Mesh dimuat: ${mesh.positions.size / 3} vertex hasil triangulasi. Pilih PNG jika tersedia."
-                              glView.requestRender()
-                          }
-                          PICK_PNG -> {
-                              val bitmap = contentResolver.openInputStream(uri)!!.use { BitmapFactory.decodeStream(it) }
-                                  ?: error("PNG tidak dapat dibaca")
-                              renderer.setTexture(bitmap)
-                              status.text = "Tekstur dimuat: ${bitmap.width} × ${bitmap.height}. Seret layar untuk memutar model."
-                              glView.requestRender()
-                          }
-                      }
-                  } catch (e: Exception) {
-                      status.text = "Gagal memuat file: ${e.message ?: e.javaClass.simpleName}"
-                  }
-              }
-          }
+                          elif isinstance(exported, str):
+                              # UnityPy may return OBJ-like text. Validate it
+                              # and repair face normal references if no vn rows exist.
+                              raw_lines = exported.splitlines()
+                              vertex_count = sum(
+                                  1 for line in raw_lines
+                                  if line.strip().startswith("v ")
+                              )
+                              uv_count = sum(
+                                  1 for line in raw_lines
+                                  if line.strip().startswith("vt ")
+                              )
+                              normal_count = sum(
+                                  1 for line in raw_lines
+                                  if line.strip().startswith("vn ")
+                              )
+                              face_count = sum(
+                                  1 for line in raw_lines
+                                  if line.strip().startswith("f ")
+                              )
 
-          private data class ObjMesh(val positions: FloatArray, val uvs: FloatArray)
+                              looks_like_obj = (
+                                  vertex_count > 0
+                                  and face_count > 0
+                                  and all(
+                                      any(line.strip().startswith(prefix)
+                                          for line in raw_lines)
+                                      for prefix in ("v ", "f ")
+                                  )
+                              )
 
-          private object ObjParser {
-              fun parse(text: String): ObjMesh {
-                  val vertices = mutableListOf<FloatArray>()
-                  val tex = mutableListOf<FloatArray>()
-                  val outV = mutableListOf<Float>()
-                  val outT = mutableListOf<Float>()
-                  fun resolve(i: Int, size: Int): Int = if (i < 0) size + i else i - 1
-                  for (raw in text.lineSequence()) {
-                      val line = raw.trim()
-                      if (line.isEmpty() || line.startsWith("#")) continue
-                      val parts = line.split(Regex("\\s+"))
-                      when (parts[0]) {
-                          "v" -> if (parts.size >= 4) vertices.add(floatArrayOf(parts[1].toFloat(), parts[2].toFloat(), parts[3].toFloat()))
-                          "vt" -> if (parts.size >= 3) tex.add(floatArrayOf(parts[1].toFloat(), parts[2].toFloat()))
-                          "f" -> if (parts.size >= 4) {
-                              val refs = parts.drop(1).map { token ->
-                                  val c = token.split("/")
-                                  val vi = resolve(c[0].toInt(), vertices.size)
-                                  val ti = if (c.size > 1 && c[1].isNotEmpty()) resolve(c[1].toInt(), tex.size) else -1
-                                  require(vi in vertices.indices) { "Indeks vertex OBJ di luar rentang" }
-                                  require(ti == -1 || ti in tex.indices) { "Indeks UV OBJ di luar rentang" }
-                                  Pair(vi, ti)
-                              }
-                              for (i in 1 until refs.size - 1) {
-                                  for (r in listOf(refs[0], refs[i], refs[i + 1])) {
-                                      val v = vertices[r.first]
-                                      outV.add(v[0]); outV.add(v[1]); outV.add(v[2])
-                                      val t = if (r.second >= 0) tex[r.second] else floatArrayOf(0f, 0f)
-                                      outT.add(t[0]); outT.add(1f - t[1])
+                              if looks_like_obj:
+                                  fixed_lines = []
+                                  stripped_normal_refs = 0
+                                  for line in raw_lines:
+                                      parts = line.strip().split()
+                                      if parts and parts[0] == "f" and normal_count == 0:
+                                          repaired = ["f"]
+                                          for token in parts[1:]:
+                                              # If exporter emits v/vt/vn but
+                                              # declares no vn rows, drop only
+                                              # the nonexistent normal index.
+                                              bits = token.split("/")
+                                              if len(bits) == 3 and bits[2]:
+                                                  token = "/".join(bits[:2])
+                                                  stripped_normal_refs += 1
+                                              repaired.append(token)
+                                          fixed_lines.append(" ".join(repaired))
+                                      else:
+                                          fixed_lines.append(line)
+
+                                  destination = MESHES / f"{stem}.obj"
+                                  destination.write_text(
+                                      "\n".join(fixed_lines) + "\n",
+                                      encoding="utf-8",
+                                  )
+                                  record["mesh_validation"] = {
+                                      "looks_like_obj": True,
+                                      "vertices": vertex_count,
+                                      "uvs": uv_count,
+                                      "normals": normal_count,
+                                      "faces": face_count,
+                                      "stripped_missing_normal_indices": stripped_normal_refs,
+                                      "note": (
+                                          "OBJ-like output validated structurally; "
+                                          "normals are absent when normal_count is zero. "
+                                          "Renderer should use an unlit shader or generate normals."
+                                      ),
                                   }
-                              }
-                          }
-                      }
-                  }
-                  require(outV.isNotEmpty()) { "OBJ tidak memiliki face/segitiga yang dapat dirender" }
-                  val minV = FloatArray(3) { Float.POSITIVE_INFINITY }
-                  val maxV = FloatArray(3) { Float.NEGATIVE_INFINITY }
-                  for (i in outV.indices step 3) for (a in 0..2) {
-                      minV[a] = min(minV[a], outV[i + a]); maxV[a] = max(maxV[a], outV[i + a])
-                  }
-                  val center = FloatArray(3) { (minV[it] + maxV[it]) * 0.5f }
-                  val extent = max(maxV[0] - minV[0], max(maxV[1] - minV[1], maxV[2] - minV[2])).coerceAtLeast(0.0001f)
-                  for (i in outV.indices step 3) for (a in 0..2) outV[i + a] = (outV[i + a] - center[a]) * (2f / extent)
-                  return ObjMesh(outV.toFloatArray(), outT.toFloatArray())
-              }
-          }
+                              else:
+                                  destination = MESHES / f"{stem}.txt"
+                                  destination.write_text(
+                                      exported,
+                                      encoding="utf-8",
+                                  )
+                                  record["mesh_validation"] = {
+                                      "looks_like_obj": False,
+                                      "vertices": vertex_count,
+                                      "uvs": uv_count,
+                                      "normals": normal_count,
+                                      "faces": face_count,
+                                      "note": "Kept as TXT because OBJ structure was not detected.",
+                                  }
 
-          private class ObjRenderer : GLSurfaceView.Renderer {
-              @Volatile private var positions = FloatArray(0)
-              @Volatile private var uvs = FloatArray(0)
-              @Volatile private var bitmapBytes: ByteArray? = null
-              @Volatile private var bitmapWidth = 0
-              @Volatile private var bitmapHeight = 0
-              @Volatile private var rotX = -15f
-              @Volatile private var rotY = 25f
-              private var vertexBuffer: FloatBuffer? = null
-              private var uvBuffer: FloatBuffer? = null
-              private var program = 0
-              private var textureId = 0
-              private var textureReady = false
-              private var width = 1
-              private var height = 1
-              private val projection = FloatArray(16)
-              private val view = FloatArray(16)
-              private val model = FloatArray(16)
-              private val mv = FloatArray(16)
-              private val mvp = FloatArray(16)
+                          elif isinstance(exported, dict):
+                              destination = MESHES / f"{stem}.json"
+                              destination.write_text(
+                                  json.dumps(
+                                      json_safe(exported),
+                                      indent=2,
+                                  ),
+                                  encoding="utf-8",
+                              )
 
-              fun setMesh(p: FloatArray, t: FloatArray) { positions = p; uvs = t; vertexBuffer = null; uvBuffer = null }
-              fun setTexture(bitmap: android.graphics.Bitmap) {
-                  val stream = java.io.ByteArrayOutputStream()
-                  bitmap.compress(android.graphics.Bitmap.CompressFormat.PNG, 100, stream)
-                  bitmapBytes = stream.toByteArray(); bitmapWidth = bitmap.width; bitmapHeight = bitmap.height; textureReady = false
-                  bitmap.recycle()
-              }
-              fun rotateBy(x: Float, y: Float) { rotY += x; rotX = (rotX + y).coerceIn(-89f, 89f) }
-              fun resetRotation() { rotX = -15f; rotY = 25f }
+                          elif exported is not None:
+                              destination = (
+                                  MESHES / f"{stem}_export.txt"
+                              )
+                              destination.write_text(
+                                  repr(exported),
+                                  encoding="utf-8",
+                              )
 
-              override fun onSurfaceCreated(gl: GL10?, config: EGLConfig?) {
-                  GLES20.glClearColor(0.08f, 0.09f, 0.12f, 1f)
-                  GLES20.glEnable(GLES20.GL_DEPTH_TEST)
-                  val vs = "attribute vec3 aPos; attribute vec2 aUV; uniform mat4 uMVP; varying vec2 vUV; void main(){ gl_Position=uMVP*vec4(aPos,1.0); vUV=aUV; }"
-                  val fs = "precision mediump float; uniform sampler2D uTex; uniform int uHasTex; varying vec2 vUV; void main(){ gl_FragColor = (uHasTex==1) ? texture2D(uTex,vUV) : vec4(0.78,0.82,0.9,1.0); }"
-                  program = link(compile(GLES20.GL_VERTEX_SHADER, vs), compile(GLES20.GL_FRAGMENT_SHADER, fs))
-                  uploadTextureIfNeeded()
-              }
-              override fun onSurfaceChanged(gl: GL10?, w: Int, h: Int) {
-                  width = w.coerceAtLeast(1); height = h.coerceAtLeast(1); GLES20.glViewport(0, 0, width, height)
-                  Matrix.perspectiveM(projection, 0, 45f, width.toFloat() / height, 0.1f, 100f)
-              }
-              override fun onDrawFrame(gl: GL10?) {
-                  GLES20.glClear(GLES20.GL_COLOR_BUFFER_BIT or GLES20.GL_DEPTH_BUFFER_BIT)
-                  val p = positions
-                  if (p.isEmpty()) return
-                  if (vertexBuffer == null || vertexBuffer!!.capacity() != p.size) vertexBuffer = direct(p)
-                  val t = uvs
-                  if (uvBuffer == null || uvBuffer!!.capacity() != t.size) uvBuffer = direct(t)
-                  uploadTextureIfNeeded()
-                  Matrix.setLookAtM(view, 0, 0f, 0f, 4.5f, 0f, 0f, 0f, 0f, 1f, 0f)
-                  Matrix.setIdentityM(model, 0)
-                  Matrix.rotateM(model, 0, rotY, 0f, 1f, 0f)
-                  Matrix.rotateM(model, 0, rotX, 1f, 0f, 0f)
-                  Matrix.multiplyMM(mv, 0, view, 0, model, 0)
-                  Matrix.multiplyMM(mvp, 0, projection, 0, mv, 0)
-                  GLES20.glUseProgram(program)
-                  val posLoc = GLES20.glGetAttribLocation(program, "aPos")
-                  val uvLoc = GLES20.glGetAttribLocation(program, "aUV")
-                  val mvpLoc = GLES20.glGetUniformLocation(program, "uMVP")
-                  GLES20.glUniformMatrix4fv(mvpLoc, 1, false, mvp, 0)
-                  GLES20.glEnableVertexAttribArray(posLoc)
-                  GLES20.glVertexAttribPointer(posLoc, 3, GLES20.GL_FLOAT, false, 0, vertexBuffer)
-                  GLES20.glEnableVertexAttribArray(uvLoc)
-                  GLES20.glVertexAttribPointer(uvLoc, 2, GLES20.GL_FLOAT, false, 0, uvBuffer)
-                  GLES20.glActiveTexture(GLES20.GL_TEXTURE0)
-                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
-                  GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uTex"), 0)
-                  GLES20.glUniform1i(GLES20.glGetUniformLocation(program, "uHasTex"), if (textureReady) 1 else 0)
-                  GLES20.glDrawArrays(GLES20.GL_TRIANGLES, 0, p.size / 3)
-                  GLES20.glDisableVertexAttribArray(posLoc); GLES20.glDisableVertexAttribArray(uvLoc)
-              }
-              private fun uploadTextureIfNeeded() {
-                  val bytes = bitmapBytes ?: return
-                  if (textureReady) return
-                  val bmp = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return
-                  if (textureId == 0) { val ids = IntArray(1); GLES20.glGenTextures(1, ids, 0); textureId = ids[0] }
-                  GLES20.glBindTexture(GLES20.GL_TEXTURE_2D, textureId)
-                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MIN_FILTER, GLES20.GL_LINEAR)
-                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_MAG_FILTER, GLES20.GL_LINEAR)
-                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_S, GLES20.GL_REPEAT)
-                  GLES20.glTexParameteri(GLES20.GL_TEXTURE_2D, GLES20.GL_TEXTURE_WRAP_T, GLES20.GL_REPEAT)
-                  android.opengl.GLUtils.texImage2D(GLES20.GL_TEXTURE_2D, 0, bmp, 0)
-                  bmp.recycle(); textureReady = true
-              }
-              private fun direct(a: FloatArray): FloatBuffer = ByteBuffer.allocateDirect(a.size * 4).order(ByteOrder.nativeOrder()).asFloatBuffer().apply { put(a); position(0) }
-              private fun compile(type: Int, src: String): Int { val s = GLES20.glCreateShader(type); GLES20.glShaderSource(s, src); GLES20.glCompileShader(s); val ok = IntArray(1); GLES20.glGetShaderiv(s, GLES20.GL_COMPILE_STATUS, ok, 0); check(ok[0] != 0) { GLES20.glGetShaderInfoLog(s) }; return s }
-              private fun link(v: Int, f: Int): Int { val p = GLES20.glCreateProgram(); GLES20.glAttachShader(p, v); GLES20.glAttachShader(p, f); GLES20.glLinkProgram(p); val ok = IntArray(1); GLES20.glGetProgramiv(p, GLES20.GL_LINK_STATUS, ok, 0); check(ok[0] != 0) { GLES20.glGetProgramInfoLog(p) }; return p }
-          }
-          EOF
+                          else:
+                              raise RuntimeError(
+                                  "Mesh exporter returned None"
+                              )
 
-      # 6. Generate Gradle Wrapper
-      - name: Generate Gradle Wrapper
-        run: gradle wrapper --gradle-version 8.9
+                          record["export_status"] = (
+                              "exporter_returned_data"
+                          )
+                          record["export_path"] = str(destination)
+                          record["export_note"] = (
+                              "String outputs are saved as .obj only when vertex/face "
+                              "structure is detected; otherwise they remain .txt. "
+                              "OBJ structure does not guarantee complete Unity material/animation reconstruction."
+                          )
 
-      # 7. Build APK
-      - name: Build APK
-        run: ./gradlew assembleDebug --stacktrace
+                          report["exports"]["meshes"].append(
+                              str(destination)
+                          )
 
-      # 8. Verify APK
-      - name: Verify APK
-        run: |
-          test -f app/build/outputs/apk/debug/app-debug.apk
-          ls -lh app/build/outputs/apk/debug/app-debug.apk
+                      except Exception as exc:
+                          record["export_status"] = (
+                              "inventory_only"
+                          )
+                          record["export_error"] = str(exc)
 
-      # 9. Upload APK
-      - name: Upload APK
+                          diagnostic = (
+                              DIAGNOSTICS / f"{stem}_mesh.json"
+                          )
+
+                          diagnostic.write_text(
+                              json.dumps(
+                                  {
+                                      "path_id": path_id,
+                                      "name": record["name"],
+                                      "type": type_name,
+                                      "error": str(exc),
+                                      "available_methods": [
+                                          method
+                                          for method in dir(data)
+                                          if not method.startswith("_")
+                                      ],
+                                      "serialized_data": json_safe(data),
+                                  },
+                                  indent=2,
+                                  ensure_ascii=False,
+                              ),
+                              encoding="utf-8",
+                          )
+
+                  # AudioClip -> raw audio data when available.
+                  elif type_name == "AudioClip":
+                      try:
+                          audio_data = getattr(
+                              data, "m_AudioData", None
+                          )
+
+                          if not audio_data:
+                              raise RuntimeError(
+                                  "No embedded m_AudioData"
+                              )
+
+                          destination = AUDIO / f"{stem}.bin"
+                          destination.write_bytes(audio_data)
+
+                          record["export_status"] = "exported"
+                          record["export_path"] = str(destination)
+
+                          report["exports"]["audio"].append(
+                              str(destination)
+                          )
+
+                      except Exception as exc:
+                          record["export_status"] = (
+                              "inventory_only"
+                          )
+                          record["export_error"] = str(exc)
+
+                  # TextAsset -> bytes
+                  elif type_name == "TextAsset":
+                      try:
+                          text_data = getattr(
+                              data, "m_Script", ""
+                          )
+
+                          if isinstance(text_data, str):
+                              payload = text_data.encode("utf-8")
+                          else:
+                              payload = bytes(text_data)
+
+                          destination = (
+                              TEXTASSETS / f"{stem}.bin"
+                          )
+                          destination.write_bytes(payload)
+
+                          record["export_status"] = "exported"
+                          record["export_path"] = str(destination)
+
+                          report["exports"]["textassets"].append(
+                              str(destination)
+                          )
+
+                      except Exception as exc:
+                          record["export_status"] = (
+                              "inventory_only"
+                          )
+                          record["export_error"] = str(exc)
+
+              except Exception as exc:
+                  record["export_status"] = "read_failed"
+                  record["error"] = str(exc)
+                  report["errors"].append({
+                      "type": type_name,
+                      "path_id": path_id,
+                      "error": str(exc),
+                      "traceback": traceback.format_exc(),
+                  })
+
+              report["assets"].append(record)
+
+              print(
+                  f"[{index + 1}/{len(objects)}] "
+                  f"{type_name} "
+                  f"path_id={path_id} "
+                  f"status={record['export_status']}"
+              )
+
+          report_path = OUT / "asset_report.json"
+          report_path.write_text(
+              json.dumps(
+                  report,
+                  indent=2,
+                  ensure_ascii=False,
+              ),
+              encoding="utf-8",
+          )
+
+          # Human-readable summary.
+          summary_path = OUT / "SUMMARY.txt"
+
+          counts = {}
+          statuses = {}
+
+          for asset in report["assets"]:
+              kind = asset["type"]
+              status = asset["export_status"]
+
+              counts[kind] = counts.get(kind, 0) + 1
+              statuses[status] = statuses.get(status, 0) + 1
+
+          lines = [
+              "AssetFlux UnityBundle Extraction",
+              f"Source: {SOURCE}",
+              f"UnityPy version: {report['unitypy_version']}",
+              f"Total objects: {report['asset_count']}",
+              "",
+              "Object counts:",
+          ]
+
+          for kind, count in sorted(counts.items()):
+              lines.append(f"  {kind}: {count}")
+
+          lines.extend(["", "Export statuses:"])
+
+          for status, count in sorted(statuses.items()):
+              lines.append(f"  {status}: {count}")
+
+          lines.extend([
+              "",
+              f"Textures exported: "
+              f"{len(report['exports']['textures'])}",
+              f"Mesh outputs: "
+              f"{len(report['exports']['meshes'])}",
+              f"Audio outputs: "
+              f"{len(report['exports']['audio'])}",
+              f"TextAsset outputs: "
+              f"{len(report['exports']['textassets'])}",
+              f"Errors: {len(report['errors'])}",
+              "",
+              "Important:",
+              "- OBJ-like Mesh strings are saved as .obj after structural checks.",
+              "- If no vn rows exist, missing normal references are removed from faces.",
+              "- Missing normals may require an unlit shader or normal generation in the renderer.",
+              "- OBJ export does not reconstruct Unity materials, scene hierarchy, or animation by itself.",
+              "- References are serialized pointer candidates; verify relationships before using them.",
+          ])
+
+          summary_path.write_text(
+              "\n".join(lines) + "\n",
+              encoding="utf-8",
+          )
+
+          print("\nExtraction complete.")
+          print(summary_path.read_text(encoding="utf-8"))
+          PYTHON
+
+          python extract_unity.py
+
+      - name: Upload extraction results
         uses: actions/upload-artifact@v4
         with:
-          name: AssetFlux-Native-v0.2
-          path: app/build/outputs/apk/debug/app-debug.apk
+          name: AssetFlux-UnityPy-Extraction
+          path: output/
           if-no-files-found: error
+          retention-days: 7
