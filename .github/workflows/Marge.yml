@@ -1,4 +1,4 @@
-name: AssetFlux UnityBundle Extraction
+name: Test UnityPy on Android
 
 on:
   workflow_dispatch:
@@ -7,649 +7,239 @@ permissions:
   contents: read
 
 jobs:
-  extract:
+  test-unitypy-android:
     runs-on: ubuntu-latest
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
 
-      - name: Set up Python
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python for build tools
         uses: actions/setup-python@v5
         with:
           python-version: "3.11"
 
-      - name: Install UnityPy
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install UnityPy
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.9"
 
-      - name: Validate source bundle
+      - name: Install Android SDK packages
         shell: bash
         run: |
           set -euo pipefail
-
-          SOURCE="samples/nextkagura_skill03_effect_1.unity3d"
-
-          if [ ! -f "$SOURCE" ]; then
-            echo "::error::Bundle tidak ditemukan: $SOURCE"
-            exit 1
+          SDKMANAGER="$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager"
+          if [ ! -f "$SDKMANAGER" ]; then
+            SDKMANAGER="$(find "$ANDROID_HOME/cmdline-tools" -name sdkmanager -type f | head -n 1)"
           fi
+          test -n "$SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses >/dev/null || true
+          "$SDKMANAGER" \
+            "platform-tools" \
+            "platforms;android-35" \
+            "build-tools;35.0.0"
 
-          echo "Bundle ditemukan."
-          ls -lh "$SOURCE"
-
-      - name: Extract assets and relationships
+      - name: Generate minimal Chaquopy compatibility app
         shell: bash
         run: |
           set -euo pipefail
+          mkdir -p app/src/main/java/com/assetflux/unitypytest
+          mkdir -p app/src/main/python
+          mkdir -p app/src/main/res/values
 
-          mkdir -p output/textures
-          mkdir -p output/meshes
-          mkdir -p output/audio
-          mkdir -p output/textassets
-          mkdir -p output/diagnostics
+          cat > settings.gradle <<'EOF'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "AssetFlux-UnityPy-Android-Test"
+          include(":app")
+          EOF
 
-          cat > extract_unity.py <<'PYTHON'
-          import json
-          import traceback
-          from pathlib import Path
+          cat > build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application' version '8.7.3' apply false
+              id 'org.jetbrains.kotlin.android' version '2.0.21' apply false
+              id 'com.chaquo.python' version '17.0.0' apply false
+          }
+          EOF
 
-          import UnityPy
+          cat > gradle.properties <<'EOF'
+          org.gradle.jvmargs=-Xmx3g -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          EOF
 
-          SOURCE = Path(
-              "samples/nextkagura_skill03_effect_1.unity3d"
-          )
-
-          OUT = Path("output")
-          TEXTURES = OUT / "textures"
-          MESHES = OUT / "meshes"
-          AUDIO = OUT / "audio"
-          TEXTASSETS = OUT / "textassets"
-          DIAGNOSTICS = OUT / "diagnostics"
-
-          for directory in (
-              TEXTURES,
-              MESHES,
-              AUDIO,
-              TEXTASSETS,
-              DIAGNOSTICS,
-          ):
-              directory.mkdir(parents=True, exist_ok=True)
-
-          def safe_name(value):
-              value = str(value or "unnamed")
-              return "".join(
-                  c if c.isalnum() or c in "-_." else "_"
-                  for c in value
-              )[:100] or "unnamed"
-
-          def get_name(data):
-              try:
-                  return str(getattr(data, "m_Name", "") or "")
-              except Exception:
-                  return ""
-
-          def pointer_info(value):
-              """Return a pointer description without dereferencing it."""
-              if value is None:
-                  return None
-
-              result = {}
-
-              for attr in ("file_id", "path_id"):
-                  try:
-                      v = getattr(value, attr, None)
-                      if v is not None:
-                          result[attr] = int(v)
-                  except Exception:
-                      pass
-
-              if result:
-                  result["python_type"] = type(value).__name__
-                  return result
-
-              return None
-
-          def walk(value, path="$", depth=0, seen=None):
-              """
-              Find serialized pointer references while avoiding cycles.
-              The output is diagnostic metadata, not a full Unity serializer.
-              """
-              if seen is None:
-                  seen = set()
-
-              if depth > 12:
-                  return []
-
-              ptr = pointer_info(value)
-              if ptr is not None:
-                  return [{
-                      "field": path,
-                      "reference": ptr,
-                  }]
-
-              if value is None or isinstance(
-                  value, (str, bytes, int, float, bool)
-              ):
-                  return []
-
-              ident = id(value)
-              if ident in seen:
-                  return []
-              seen.add(ident)
-
-              found = []
-
-              if isinstance(value, dict):
-                  items = value.items()
-              elif isinstance(value, (list, tuple, set)):
-                  items = enumerate(value)
-              else:
-                  # Avoid traversing arbitrary Python internals.
-                  try:
-                      attrs = vars(value)
-                  except Exception:
-                      attrs = None
-
-                  if attrs is None:
-                      return found
-
-                  items = attrs.items()
-
-              try:
-                  for key, child in items:
-                      child_path = f"{path}.{key}"
-
-                      found.extend(
-                          walk(
-                              child,
-                              child_path,
-                              depth + 1,
-                              seen,
-                          )
-                      )
-              except Exception:
-                  pass
-
-              return found
-
-          def json_safe(value, depth=0):
-              """Convert common UnityPy values to JSON-safe diagnostics."""
-              if depth > 6:
-                  return "<max-depth>"
-
-              if value is None or isinstance(
-                  value, (str, int, float, bool)
-              ):
-                  return value
-
-              ptr = pointer_info(value)
-              if ptr is not None:
-                  return {"pointer": ptr}
-
-              if isinstance(value, bytes):
-                  return {
-                      "type": "bytes",
-                      "length": len(value),
-                  }
-
-              if isinstance(value, dict):
-                  result = {}
-                  for k, v in list(value.items())[:300]:
-                      result[str(k)] = json_safe(v, depth + 1)
-                  return result
-
-              if isinstance(value, (list, tuple)):
-                  return [
-                      json_safe(v, depth + 1)
-                      for v in value[:300]
-                  ]
-
-              try:
-                  attrs = vars(value)
-              except Exception:
-                  return {
-                      "type": type(value).__name__,
-                      "repr": str(value)[:300],
-                  }
-
-              result = {"type": type(value).__name__}
-
-              for key, child in list(attrs.items())[:100]:
-                  if key.startswith("_"):
-                      continue
-                  try:
-                      result[key] = json_safe(child, depth + 1)
-                  except Exception:
-                      result[key] = "<unavailable>"
-
-              return result
-
-          report = {
-              "source": str(SOURCE),
-              "unitypy_version": getattr(
-                  UnityPy, "__version__", "unknown"
-              ),
-              "asset_count": 0,
-              "assets": [],
-              "exports": {
-                  "textures": [],
-                  "meshes": [],
-                  "audio": [],
-                  "textassets": [],
-              },
-              "errors": [],
+          cat > app/build.gradle <<'EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+              id 'com.chaquo.python'
           }
 
-          print(f"Loading bundle: {SOURCE}")
-          env = UnityPy.load(str(SOURCE))
+          android {
+              namespace 'com.assetflux.unitypytest'
+              compileSdk 35
 
-          objects = list(env.objects)
-          report["asset_count"] = len(objects)
+              defaultConfig {
+                  applicationId 'com.assetflux.unitypytest'
+                  minSdk 24
+                  targetSdk 35
+                  versionCode 1
+                  versionName "0.1.0"
 
-          print(f"Objects found: {len(objects)}")
+                  ndk {
+                      abiFilters "arm64-v8a", "armeabi-v7a"
+                  }
 
-          for index, obj in enumerate(objects):
-              try:
-                  type_name = str(obj.type.name)
-              except Exception:
-                  type_name = "Unknown"
-
-              try:
-                  path_id = int(obj.path_id)
-              except Exception:
-                  path_id = index
-
-              record = {
-                  "type": type_name,
-                  "path_id": path_id,
-                  "name": "",
-                  "export_status": "inventory_only",
-                  "references": [],
-                  "data": {},
+                  python {
+                      version "3.11"
+                      pip {
+                          // Compatibility probe: UnityPy's compiled dependencies
+                          // may require Android-compatible wheels.
+                          install "UnityPy"
+                      }
+                  }
               }
 
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+
+              kotlinOptions {
+                  jvmTarget = '17'
+              }
+          }
+          EOF
+
+          cat > app/src/main/res/values/styles.xml <<'EOF'
+          <resources>
+              <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
+                  <item name="android:colorAccent">#6750A4</item>
+              </style>
+          </resources>
+          EOF
+
+          cat > app/src/main/AndroidManifest.xml <<'EOF'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <application
+                  android:theme="@style/AppTheme"
+                  android:label="AssetFlux UnityPy Test"
+                  android:allowBackup="false"
+                  android:supportsRtl="true">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          EOF
+
+          cat > app/src/main/python/unity_probe.py <<'PY'
+          import json
+          import traceback
+
+          def probe():
+              result = {
+                  "unitypy_imported": False,
+                  "unitypy_version": None,
+                  "dependencies": {},
+                  "error": None,
+              }
               try:
-                  data = obj.read()
-                  record["name"] = get_name(data)
-
-                  # Record references found in serialized fields.
-                  try:
-                      record["references"] = walk(data)
-                  except Exception as exc:
-                      record["reference_scan_error"] = str(exc)
-
-                  # Keep selected metadata for analysis.
-                  if type_name in (
-                      "GameObject",
-                      "Transform",
-                      "MeshFilter",
-                      "MeshRenderer",
-                      "SkinnedMeshRenderer",
-                      "Material",
-                      "Mesh",
-                      "AnimationClip",
-                      "Animation",
-                      "ParticleSystem",
-                      "ParticleSystemRenderer",
-                      "Shader",
-                      "Texture2D",
-                  ):
+                  import UnityPy
+                  result["unitypy_imported"] = True
+                  result["unitypy_version"] = getattr(UnityPy, "__version__", "unknown")
+                  for module_name in ("lz4", "brotli", "PIL", "texture2ddecoder", "etcpak"):
                       try:
-                          record["data"] = json_safe(data)
+                          __import__(module_name)
+                          result["dependencies"][module_name] = "ok"
                       except Exception as exc:
-                          record["data_error"] = str(exc)
-
-                  stem = (
-                      f"{path_id}_"
-                      f"{safe_name(record['name'] or type_name)}"
-                  )
-
-                  # Texture2D -> PNG
-                  if type_name == "Texture2D":
-                      try:
-                          image = data.image
-                          if image is None:
-                              raise RuntimeError(
-                                  "UnityPy returned no image"
-                              )
-
-                          destination = TEXTURES / f"{stem}.png"
-                          image.save(destination)
-
-                          record["export_status"] = "exported"
-                          record["export_path"] = str(destination)
-
-                          report["exports"]["textures"].append(
-                              str(destination)
-                          )
-
-                      except Exception as exc:
-                          record["export_status"] = "failed"
-                          record["export_error"] = str(exc)
-
-                  # Mesh -> attempt supported UnityPy exporter.
-                  elif type_name == "Mesh":
-                      try:
-                          exporter = getattr(data, "export", None)
-
-                          if not callable(exporter):
-                              raise RuntimeError(
-                                  "Mesh.export() is unavailable "
-                                  "in this UnityPy version"
-                              )
-
-                          exported = exporter()
-
-                          if isinstance(exported, bytes):
-                              destination = MESHES / f"{stem}.bin"
-                              destination.write_bytes(exported)
-
-                          elif isinstance(exported, str):
-                              # UnityPy may return OBJ-like text. Validate it
-                              # and repair face normal references if no vn rows exist.
-                              raw_lines = exported.splitlines()
-                              vertex_count = sum(
-                                  1 for line in raw_lines
-                                  if line.strip().startswith("v ")
-                              )
-                              uv_count = sum(
-                                  1 for line in raw_lines
-                                  if line.strip().startswith("vt ")
-                              )
-                              normal_count = sum(
-                                  1 for line in raw_lines
-                                  if line.strip().startswith("vn ")
-                              )
-                              face_count = sum(
-                                  1 for line in raw_lines
-                                  if line.strip().startswith("f ")
-                              )
-
-                              looks_like_obj = (
-                                  vertex_count > 0
-                                  and face_count > 0
-                                  and all(
-                                      any(line.strip().startswith(prefix)
-                                          for line in raw_lines)
-                                      for prefix in ("v ", "f ")
-                                  )
-                              )
-
-                              if looks_like_obj:
-                                  fixed_lines = []
-                                  stripped_normal_refs = 0
-                                  for line in raw_lines:
-                                      parts = line.strip().split()
-                                      if parts and parts[0] == "f" and normal_count == 0:
-                                          repaired = ["f"]
-                                          for token in parts[1:]:
-                                              # If exporter emits v/vt/vn but
-                                              # declares no vn rows, drop only
-                                              # the nonexistent normal index.
-                                              bits = token.split("/")
-                                              if len(bits) == 3 and bits[2]:
-                                                  token = "/".join(bits[:2])
-                                                  stripped_normal_refs += 1
-                                              repaired.append(token)
-                                          fixed_lines.append(" ".join(repaired))
-                                      else:
-                                          fixed_lines.append(line)
-
-                                  destination = MESHES / f"{stem}.obj"
-                                  destination.write_text(
-                                      "\n".join(fixed_lines) + "\n",
-                                      encoding="utf-8",
-                                  )
-                                  record["mesh_validation"] = {
-                                      "looks_like_obj": True,
-                                      "vertices": vertex_count,
-                                      "uvs": uv_count,
-                                      "normals": normal_count,
-                                      "faces": face_count,
-                                      "stripped_missing_normal_indices": stripped_normal_refs,
-                                      "note": (
-                                          "OBJ-like output validated structurally; "
-                                          "normals are absent when normal_count is zero. "
-                                          "Renderer should use an unlit shader or generate normals."
-                                      ),
-                                  }
-                              else:
-                                  destination = MESHES / f"{stem}.txt"
-                                  destination.write_text(
-                                      exported,
-                                      encoding="utf-8",
-                                  )
-                                  record["mesh_validation"] = {
-                                      "looks_like_obj": False,
-                                      "vertices": vertex_count,
-                                      "uvs": uv_count,
-                                      "normals": normal_count,
-                                      "faces": face_count,
-                                      "note": "Kept as TXT because OBJ structure was not detected.",
-                                  }
-
-                          elif isinstance(exported, dict):
-                              destination = MESHES / f"{stem}.json"
-                              destination.write_text(
-                                  json.dumps(
-                                      json_safe(exported),
-                                      indent=2,
-                                  ),
-                                  encoding="utf-8",
-                              )
-
-                          elif exported is not None:
-                              destination = (
-                                  MESHES / f"{stem}_export.txt"
-                              )
-                              destination.write_text(
-                                  repr(exported),
-                                  encoding="utf-8",
-                              )
-
-                          else:
-                              raise RuntimeError(
-                                  "Mesh exporter returned None"
-                              )
-
-                          record["export_status"] = (
-                              "exporter_returned_data"
-                          )
-                          record["export_path"] = str(destination)
-                          record["export_note"] = (
-                              "String outputs are saved as .obj only when vertex/face "
-                              "structure is detected; otherwise they remain .txt. "
-                              "OBJ structure does not guarantee complete Unity material/animation reconstruction."
-                          )
-
-                          report["exports"]["meshes"].append(
-                              str(destination)
-                          )
-
-                      except Exception as exc:
-                          record["export_status"] = (
-                              "inventory_only"
-                          )
-                          record["export_error"] = str(exc)
-
-                          diagnostic = (
-                              DIAGNOSTICS / f"{stem}_mesh.json"
-                          )
-
-                          diagnostic.write_text(
-                              json.dumps(
-                                  {
-                                      "path_id": path_id,
-                                      "name": record["name"],
-                                      "type": type_name,
-                                      "error": str(exc),
-                                      "available_methods": [
-                                          method
-                                          for method in dir(data)
-                                          if not method.startswith("_")
-                                      ],
-                                      "serialized_data": json_safe(data),
-                                  },
-                                  indent=2,
-                                  ensure_ascii=False,
-                              ),
-                              encoding="utf-8",
-                          )
-
-                  # AudioClip -> raw audio data when available.
-                  elif type_name == "AudioClip":
-                      try:
-                          audio_data = getattr(
-                              data, "m_AudioData", None
-                          )
-
-                          if not audio_data:
-                              raise RuntimeError(
-                                  "No embedded m_AudioData"
-                              )
-
-                          destination = AUDIO / f"{stem}.bin"
-                          destination.write_bytes(audio_data)
-
-                          record["export_status"] = "exported"
-                          record["export_path"] = str(destination)
-
-                          report["exports"]["audio"].append(
-                              str(destination)
-                          )
-
-                      except Exception as exc:
-                          record["export_status"] = (
-                              "inventory_only"
-                          )
-                          record["export_error"] = str(exc)
-
-                  # TextAsset -> bytes
-                  elif type_name == "TextAsset":
-                      try:
-                          text_data = getattr(
-                              data, "m_Script", ""
-                          )
-
-                          if isinstance(text_data, str):
-                              payload = text_data.encode("utf-8")
-                          else:
-                              payload = bytes(text_data)
-
-                          destination = (
-                              TEXTASSETS / f"{stem}.bin"
-                          )
-                          destination.write_bytes(payload)
-
-                          record["export_status"] = "exported"
-                          record["export_path"] = str(destination)
-
-                          report["exports"]["textassets"].append(
-                              str(destination)
-                          )
-
-                      except Exception as exc:
-                          record["export_status"] = (
-                              "inventory_only"
-                          )
-                          record["export_error"] = str(exc)
-
+                          result["dependencies"][module_name] = f"FAILED: {type(exc).__name__}: {exc}"
               except Exception as exc:
-                  record["export_status"] = "read_failed"
-                  record["error"] = str(exc)
-                  report["errors"].append({
-                      "type": type_name,
-                      "path_id": path_id,
-                      "error": str(exc),
-                      "traceback": traceback.format_exc(),
-                  })
+                  result["error"] = f"{type(exc).__name__}: {exc}"
+                  result["traceback"] = traceback.format_exc()
+              return json.dumps(result, indent=2)
+          PY
 
-              report["assets"].append(record)
+          cat > app/src/main/java/com/assetflux/unitypytest/MainActivity.kt <<'EOF'
+          package com.assetflux.unitypytest
 
-              print(
-                  f"[{index + 1}/{len(objects)}] "
-                  f"{type_name} "
-                  f"path_id={path_id} "
-                  f"status={record['export_status']}"
-              )
+          import android.app.Activity
+          import android.os.Bundle
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import com.chaquo.python.Python
+          import com.chaquo.python.android.AndroidPlatform
 
-          report_path = OUT / "asset_report.json"
-          report_path.write_text(
-              json.dumps(
-                  report,
-                  indent=2,
-                  ensure_ascii=False,
-              ),
-              encoding="utf-8",
-          )
+          class MainActivity : Activity() {
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  val output = TextView(this).apply {
+                      textSize = 14f
+                      setPadding(24, 24, 24, 24)
+                      text = "Memulai pengujian UnityPy..."
+                  }
+                  setContentView(ScrollView(this).apply { addView(output) })
 
-          # Human-readable summary.
-          summary_path = OUT / "SUMMARY.txt"
+                  Thread {
+                      val result = try {
+                          if (!Python.isStarted()) {
+                              Python.start(AndroidPlatform(this))
+                          }
+                          Python.getInstance()
+                              .getModule("unity_probe")
+                              .callAttr("probe")
+                              .toString()
+                      } catch (e: Exception) {
+                          "GAGAL MEMULAI PYTHON:\n${e.javaClass.simpleName}: ${e.message}"
+                      }
+                      runOnUiThread {
+                          output.text = "AssetFlux — Uji kompatibilitas UnityPy\n\n$result"
+                      }
+                  }.start()
+              }
+          }
+          EOF
 
-          counts = {}
-          statuses = {}
+      - name: Generate Gradle Wrapper
+        run: gradle wrapper --gradle-version 8.9
 
-          for asset in report["assets"]:
-              kind = asset["type"]
-              status = asset["export_status"]
+      - name: Build compatibility APK
+        run: ./gradlew assembleDebug --stacktrace
 
-              counts[kind] = counts.get(kind, 0) + 1
-              statuses[status] = statuses.get(status, 0) + 1
+      - name: Verify APK
+        run: |
+          set -euo pipefail
+          APK="app/build/outputs/apk/debug/app-debug.apk"
+          test -f "$APK"
+          ls -lh "$APK"
 
-          lines = [
-              "AssetFlux UnityBundle Extraction",
-              f"Source: {SOURCE}",
-              f"UnityPy version: {report['unitypy_version']}",
-              f"Total objects: {report['asset_count']}",
-              "",
-              "Object counts:",
-          ]
-
-          for kind, count in sorted(counts.items()):
-              lines.append(f"  {kind}: {count}")
-
-          lines.extend(["", "Export statuses:"])
-
-          for status, count in sorted(statuses.items()):
-              lines.append(f"  {status}: {count}")
-
-          lines.extend([
-              "",
-              f"Textures exported: "
-              f"{len(report['exports']['textures'])}",
-              f"Mesh outputs: "
-              f"{len(report['exports']['meshes'])}",
-              f"Audio outputs: "
-              f"{len(report['exports']['audio'])}",
-              f"TextAsset outputs: "
-              f"{len(report['exports']['textassets'])}",
-              f"Errors: {len(report['errors'])}",
-              "",
-              "Important:",
-              "- OBJ-like Mesh strings are saved as .obj after structural checks.",
-              "- If no vn rows exist, missing normal references are removed from faces.",
-              "- Missing normals may require an unlit shader or normal generation in the renderer.",
-              "- OBJ export does not reconstruct Unity materials, scene hierarchy, or animation by itself.",
-              "- References are serialized pointer candidates; verify relationships before using them.",
-          ])
-
-          summary_path.write_text(
-              "\n".join(lines) + "\n",
-              encoding="utf-8",
-          )
-
-          print("\nExtraction complete.")
-          print(summary_path.read_text(encoding="utf-8"))
-          PYTHON
-
-          python extract_unity.py
-
-      - name: Upload extraction results
+      - name: Upload compatibility APK
         uses: actions/upload-artifact@v4
         with:
-          name: AssetFlux-UnityPy-Extraction
-          path: output/
+          name: AssetFlux-UnityPy-Android-Compatibility-Test
+          path: app/build/outputs/apk/debug/app-debug.apk
           if-no-files-found: error
           retention-days: 7
